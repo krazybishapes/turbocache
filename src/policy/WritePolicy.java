@@ -2,5 +2,5 @@ package policy;
 
 public enum WritePolicy {
     WRITE_THROUGH,
-    WRITE_BEHIND
+    WRITE_BACK
 }

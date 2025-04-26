@@ -1,142 +1,36 @@
 package cache;
 
-import backingstore.BackingStore;
 import config.CacheConfig;
-import policy.EvictionPolicy;
-import policy.ExpirationStrategy;
-import policy.LoadingMode;
-import policy.WritePolicy;
+import loader.BackStoreDataLoader;
+import scheduler.SchedulerService;
+import scheduler.SchedulerServiceImpl;
 
+import java.io.Serial;
 import java.io.Serializable;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.function.Consumer;
-import java.util.function.Function;
 import java.util.logging.Logger;
 
-public class TurboCache <K,V> implements Serializable, Cache<K,V> {
+public class TurboCache <K,V> implements Serializable , Cache<K,V> {
     private final Logger logger = Logger.getLogger(TurboCache.class.getName());
-    /**
-     * cache.Cache to store Key & Value pair,CacheEntry class to hold the value and its expiry time.
-     * This is used to store the data in memory and fetching data in O(1) time complexity.
-     * Concurrent Hashmap is used for thread safety.
-     */
-    private final ConcurrentHashMap<K, CacheEntry<V>> cache;
-    /**
-     * LinkedHashMap to store the key and value pair for LRU eviction policy.
-     */
-    private LinkedHashMap<K, V> lruCache = null;
-    /**
-     * Backing store to store the data in persistent storage. Data would be fetched from backing store
-     * if not found in cache and also written to backing store if write policy is set to WRITE_THROUGH.
-     */
-    private final BackingStore<K, V> backingStore;
-    /**
-     * Write policy to determine how the data should be written to the backing store.
-     * WRITE_THROUGH - write data to backing store immediately- This is implemented only
-     * WRITE_BACK - write data to backing store when cache is full
-     * WRITE_AROUND - write data to backing store when data is not found in cache
-     * WRITE_BEHIND - write data to backing store in background
-     * WRITE_THROUGH is the default policy.
-     */
-    private final WritePolicy writePolicy;
 
-    /**
-     * Maximum size of the cache.
-     */
-    private final int maxSize;
-    /**
-     * Time to live for the cache entry in milliseconds.
-     */
+    @Serial
+    private static final long serialVersionUID = 1L;
+
+    private final InMemoryCache<K,V> cache;
+    private final LRUCache<K,V> lruCache;
+    private final SchedulerService<K,V> scheduler;
+    private final BackStoreDataLoader<K,V> dataLoader;
+
     private final long ttl;
 
-    /**
-     * Scheduler to remove the expired entries from the cache.
-     */
-    private transient ScheduledExecutorService cleaner = null;
+    public TurboCache(CacheConfig config) {
 
-    /**
-     * Executor service to load data from backing store asynchronously.
-     */
-    private transient ExecutorService asyncLoader = null;
-
-    /**
-     * Refresh duration for the cache entry in milliseconds.
-     */
-    private final long refreshDuration;
-
-    /**
-     * Eviction policy to determine how the data should be evicted from the cache.
-     */
-    private final EvictionPolicy evictionPolicy;
-
-    /**
-     * Expiration strategy to determine how the data should be expired from the cache.
-     */
-    private ExpirationStrategy expirationStrategy;
-
-    /**
-     * Callback function to be called when the cache entry is expired.
-     */
-    private transient final Consumer<K> expiryCallback;
-
-    /**
-     * Async loader function to load data from backing store asynchronously.
-     */
-    private transient final Function<K, V> asyncLoaderFunction;
-
-    /**
-     * Loading mode to determine how the data should be loaded from the backing store.
-     */
-    private final LoadingMode loadingMode;
-
-    /**
-     * Refresh scheduler to refresh keys from the backing store on a regular interval.
-     */
-    private transient ScheduledExecutorService refreshScheduler = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors());;
-
-    /**
-     * Constructor to initialize the cache with the given configuration.
-     * @param config CacheConfig object to initialize the cache with the given configuration.
-     * @param backingStore BackingStore object to store the data in persistent storage.
-     */
-    public TurboCache(CacheConfig config, BackingStore<K, V> backingStore,
-                      Consumer<K> expiryCallback,
-                      Function<K, V> asyncLoaderFunction) {
-        //Setting up cache property
-        this.maxSize = config.getMaxSize();
         this.ttl = config.getTtl();
-        this.refreshDuration = config.getRefreshDuration();
-        this.cache = new ConcurrentHashMap<>(maxSize);
-        this.evictionPolicy = config.getEvictionPolicy();
-        this.backingStore = backingStore;
-        this.writePolicy = config.getWritePolicy();
-        this.expirationStrategy = config.getExpirationStrategy();
-        this.loadingMode = config.getLoadingMode();
-        this.expiryCallback = expiryCallback;
-        this.asyncLoaderFunction = asyncLoaderFunction;
 
-        //Data structure for LRU eviction policy
-        if(this.evictionPolicy == EvictionPolicy.LRU) {
-            this.lruCache = new LinkedHashMap<>(maxSize, 0.75f, true) {
-                protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
-                    return size() > maxSize;
-                }
-            };
-        }
+        this.cache = new InMemoryCache<>(config.getMaxSize(), config.getExpirationStrategy());
+        this.lruCache = new LRUCache<>(config.getMaxSize(), config.getEvictionPolicy());
 
-        //Setting up scheduler for removing expired entries
-        if (config.getExpirationStrategy() == ExpirationStrategy.TTL) {
-            this.cleaner = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors());
-        }
-
-        //Setting up loader for loading data from backing store
-        if (config.getLoadingMode() == LoadingMode.ASYNC) {
-            this.asyncLoader = Executors.newSingleThreadExecutor();
-        } else {
-            this.asyncLoader = null;
-        }
+        this.scheduler = new SchedulerServiceImpl<>(config.getTtl(), config.getRefreshDuration());
+        this.dataLoader = new BackStoreDataLoader<>(config.getLoadingMode(), config.getWritePolicy());
     }
 
 
@@ -150,29 +44,27 @@ public class TurboCache <K,V> implements Serializable, Cache<K,V> {
      */
     @Override
     public void put(K key, V value) {
-        synchronized (lruCache) {
-            if (lruCache.size() >= maxSize) {
-                Iterator<K> iterator = lruCache.keySet().iterator();
-                if (iterator.hasNext()) {
-                    K eldestKey = iterator.next();
-                    lruCache.remove(eldestKey);
-                    cache.remove(eldestKey);
-                }
-            }
-            lruCache.put(key, value);
-        }
 
-        long expiryTime = System.currentTimeMillis() + ttl;
-        cache.put(key, new CacheEntry<>(value, expiryTime));
+        //STEP1 : Evict if required
+        K evictedKey = lruCache.evictIfRequired(key, value);
 
-        //Only write through is implemented for now
-        if (writePolicy.equals(WritePolicy.WRITE_THROUGH)) {
-            backingStore.save(key, value);
-        }
+        //STEP2: Remove from cache if evicted from LRU cache
+        if(evictedKey != null)  cache.remove(evictedKey);
 
-        scheduleCleanup(key, ttl);
-        scheduleRefresh(key, refreshDuration);
+        //STEP2: Update cache
+        cache.put(key, value, ttl);
+
+        //STEP3: Update backing store based on write policy
+        dataLoader.save(key, value);
+
+        //STEP4: Schedule cleaning expired keys from cache
+        scheduler.scheduleCleanup(key, cache);
+
+        //STEP5: Schedule refresh for the key on regular interval
+        scheduler.scheduleRefresh(key, cache, dataLoader);
     }
+
+
 
 
     /**
@@ -191,36 +83,36 @@ public class TurboCache <K,V> implements Serializable, Cache<K,V> {
     public V get(K key) {
 
         CacheEntry<V> entry = cache.get(key);
-        if(entry != null && System.currentTimeMillis() < entry.expiryTime){
-                synchronized (lruCache) {
-                    lruCache.put(key, entry.value);
+        if(entry == null){
+            //when there is any cache miss, get it from back store
+            V value = dataLoader.load(key);
+            if(value != null){
+                put(key, value);
             }
-            scheduleCleanup(key, ttl);
-            return entry.value;
+            return value;
         }
-        // Entry is expired or not found, remove it from cache
-        cache.remove(key);
-
-        //when there is any cache miss, get it from back store
-        return getFromBackStore(key);
+        if(System.currentTimeMillis() < entry.getExpiryTime()){
+            //change the key's last access order
+            lruCache.put(key, entry);
+            return entry.value;
+        }else{
+            // Entry is expired, remove it from cache
+            cache.remove(key);
+        }
+        return null;
     }
 
 
     @Override
     public void remove(K key) {
         cache.remove(key);
-        synchronized (lruCache) {
-            lruCache.remove(key);
-        }
-        //backingStore.remove(key);
+        lruCache.remove(key);
     }
 
     @Override
     public void clearCache() {
-        cache.clear();
-        synchronized (lruCache) {
-            lruCache.clear();
-        }
+        cache.clearCache();
+        lruCache.clearCache();
     }
 
     @Override
@@ -228,62 +120,7 @@ public class TurboCache <K,V> implements Serializable, Cache<K,V> {
         return cache.size();
     }
 
-    private void scheduleCleanup(K key, long ttlMillis) {
-        cleaner.schedule(() -> {
-            CacheEntry<V> entry = cache.get(key);
-            if (entry != null && System.currentTimeMillis() >= entry.expiryTime) {
-                cache.remove(key);
-                synchronized (lruCache) {
-                    lruCache.remove(key);
-                }
-                expiryCallback.accept(key);
-            }
-        }, ttlMillis, TimeUnit.MILLISECONDS);
-    }
-
-    private void scheduleRefresh(K key, long refreshDuration) {
-        cleaner.schedule(() -> {
-            CacheEntry<V> entry = cache.get(key);
-            if (entry != null) {
-
-                // Fetch data from backing store and update the cache
-                V newValue = asyncLoaderFunction.apply(key);
-                if (newValue != null && !newValue.equals(entry.value)) {
-                    put(key, newValue);
-                }
-
-            }
-        }, refreshDuration, TimeUnit.MILLISECONDS);
-    }
-
-    private V loadAsync(K key) {
-        CompletableFuture<V> future = CompletableFuture.supplyAsync(() -> asyncLoaderFunction.apply(key), asyncLoader);
-        try {
-            return future.get();
-        } catch (Exception e) {
-            logger.warning("Async loading failed for key: " + key);
-            return null;
-        }
-    }
 
 
-    private V getFromBackStore(K key) {
-        if(loadingMode == LoadingMode.ASYNC) {
-            return loadAsync(key);
-
-        }else{
-            V value = backingStore.load(key);
-            if (value != null) {
-                //add to cache
-                put(key, value);
-            }
-            return value;
-        }
-
-    }
-
-    public void shutdown() {
-        cleaner.shutdown();
-    }
 
 }
